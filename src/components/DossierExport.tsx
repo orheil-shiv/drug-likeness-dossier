@@ -14,9 +14,48 @@ import {
   Sparkles
 } from 'lucide-react';
 import { AnalysisResult } from '@/types/chem';
+import { generateDossierPdfBlob } from '@/lib/pdf-service';
 
 interface DossierExportProps {
   analysisData: AnalysisResult;
+}
+
+function svgToPngDataUrl(svgString: string, width = 360, height = 270): Promise<string> {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(svgBlob);
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(img, 0, 0, width, height);
+            const pngUrl = canvas.toDataURL('image/png');
+            URL.revokeObjectURL(url);
+            resolve(pngUrl);
+            return;
+          }
+        } catch {
+          // ignore
+        }
+        URL.revokeObjectURL(url);
+        resolve('');
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve('');
+      };
+      img.src = url;
+    } catch {
+      resolve('');
+    }
+  });
 }
 
 export const DossierExport: React.FC<DossierExportProps> = ({ analysisData }) => {
@@ -26,7 +65,7 @@ export const DossierExport: React.FC<DossierExportProps> = ({ analysisData }) =>
   const [menuOpen, setMenuOpen] = useState(false);
   const [copiedSmiles, setCopiedSmiles] = useState(false);
 
-  const compoundName = analysisData.metadata.name?.replace(/\s+/g, '_') || 'molecule';
+  const compoundName = analysisData.metadata.name?.replace(/[\s/\\:]+/g, '_') || 'molecule';
 
   const handleExportPdf = async () => {
     setIsExporting(true);
@@ -34,22 +73,56 @@ export const DossierExport: React.FC<DossierExportProps> = ({ analysisData }) =>
     setIsError(false);
 
     try {
-      const response = await fetch('/api/export-pdf', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          analysis_data: analysisData,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`PDF export failed with status ${response.status}`);
+      // 1. Prepare data with rasterized PNG if skeletal_svg exists
+      let enrichedData = { ...analysisData };
+      if (
+        (!enrichedData.depictions?.skeletal || enrichedData.depictions?.skeletal.length < 50) &&
+        enrichedData.depictions?.skeletal_svg
+      ) {
+        try {
+          const pngDataUrl = await svgToPngDataUrl(enrichedData.depictions.skeletal_svg);
+          if (pngDataUrl) {
+            enrichedData = {
+              ...enrichedData,
+              depictions: {
+                ...enrichedData.depictions,
+                skeletal: pngDataUrl,
+              },
+            };
+          }
+        } catch {
+          // ignore
+        }
       }
 
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
+      let pdfBlob: Blob | null = null;
+
+      // 2. Attempt serverless endpoint /api/export-pdf
+      try {
+        const response = await fetch('/api/export-pdf', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            analysis_data: enrichedData,
+          }),
+        });
+
+        if (response.ok) {
+          pdfBlob = await response.blob();
+        }
+      } catch (netErr) {
+        console.warn('Network call to /api/export-pdf failed, using direct client PDF generator', netErr);
+      }
+
+      // 3. Resilient client-side fallback if server response was not ok
+      if (!pdfBlob) {
+        pdfBlob = generateDossierPdfBlob(enrichedData);
+      }
+
+      // 4. Trigger direct file download in browser
+      const url = window.URL.createObjectURL(pdfBlob);
       const link = document.createElement('a');
       link.href = url;
       link.download = `${compoundName}_Cheminformatics_Dossier.pdf`;
